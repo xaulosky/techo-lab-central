@@ -29,7 +29,7 @@ const ICONS = {
   calib: '<path d="M3 12h18M3 8v8M21 8v8M8 10v4M16 10v4"/>',
 };
 const TOOLS = [
-  ['nav', 'Navegar', 'Gira, acerca y selecciona anotaciones (V)'],
+  ['nav', 'Navegar', 'Gira alrededor de la esfera. Arrástrala o haz doble clic en el techo para mover el centro de giro (V)'],
   ['pen', 'Lápiz', 'Arrastra sobre la superficie para dibujar. Botón derecho/rueda: mover cámara (D)'],
   ['pin', 'Marcador', 'Clic en la superficie para colocar un marcador con nota (M)'],
   ['measure', 'Medir', 'Clic en 2 puntos para medir distancia (R)'],
@@ -75,6 +75,33 @@ controls.screenSpacePanning = true;
 controls.maxPolarAngle = Math.PI;
 const annGroup = new THREE.Group();
 scene.add(annGroup);
+// pivote: esfera + ejes en el centro de giro (tamaño constante en pantalla)
+function makePivot(opacity) {
+  const g = new THREE.Group();
+  const sph = new THREE.Mesh(new THREE.SphereGeometry(0.3, 24, 16),
+    new THREE.MeshBasicMaterial({ color: 0x3fb6d8, transparent: true, opacity, depthTest: false }));
+  sph.renderOrder = 1000; g.add(sph);
+  for (const [dir, c] of [[[1, 0, 0], 0xff5252], [[0, 1, 0], 0x69f0ae], [[0, 0, 1], 0x448aff]]) {
+    const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(...dir).multiplyScalar(-1), new THREE.Vector3(...dir)]);
+    const l = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: c, transparent: true, opacity, depthTest: false }));
+    l.renderOrder = 1000; g.add(l);
+  }
+  scene.add(g);
+  return g;
+}
+const pivot = makePivot(0.9);
+const pivotGhost = makePivot(0.45);
+pivotGhost.visible = false;
+let pivotDrag = false;
+function pivotScreenDist(cx, cy) {
+  const r = canvas.getBoundingClientRect();
+  const v = controls.target.clone().project(camera);
+  return Math.hypot((v.x * 0.5 + 0.5) * r.width + r.left - cx, (-v.y * 0.5 + 0.5) * r.height + r.top - cy);
+}
+function setPivot(p) {
+  const off = camera.position.clone().sub(controls.target);
+  flyTo(p.clone().add(off), p.clone());
+}
 const raycaster = new THREE.Raycaster();
 raycaster.firstHitOnly = true;
 const lineMats = [];
@@ -411,6 +438,12 @@ let down = null;
 canvas.addEventListener('pointerdown', (e) => {
   down = { x: e.clientX, y: e.clientY, t: performance.now(), btn: e.button };
   if (!ready) return;
+  if (pivot.visible && e.button === 0 && e.isPrimary && pivotScreenDist(e.clientX, e.clientY) < 16) {
+    pivotDrag = true; controls.enabled = false; down = null;
+    canvas.setPointerCapture(e.pointerId);
+    canvas.style.cursor = 'grabbing';
+    return;
+  }
   if (tool === 'pen' && e.button === 0 && e.isPrimary) {
     const h = surfaceHit(e.clientX, e.clientY);
     if (h) {
@@ -424,6 +457,17 @@ canvas.addEventListener('pointerdown', (e) => {
 let moveQueued = false;
 canvas.addEventListener('pointermove', (e) => {
   if (!ready) return;
+  if (pivotDrag) {
+    const h = surfaceHit(e.clientX, e.clientY, 0);
+    pivotGhost.visible = !!h;
+    if (h) pivotGhost.position.copy(h.point);
+    dirty = true;
+    return;
+  }
+  if (!draft && e.buttons === 0) {
+    const near = pivot.visible && pivotScreenDist(e.clientX, e.clientY) < 16;
+    canvas.style.cursor = near ? 'move' : tool === 'nav' ? 'grab' : 'crosshair';
+  }
   if (draft?.drawing) {
     const dx = e.clientX - draft.last.x, dy = e.clientY - draft.last.y;
     if (dx * dx + dy * dy >= 9) {
@@ -440,6 +484,13 @@ canvas.addEventListener('pointermove', (e) => {
 });
 
 canvas.addEventListener('pointerup', (e) => {
+  if (pivotDrag) {
+    pivotDrag = false; controls.enabled = true;
+    if (pivotGhost.visible) setPivot(pivotGhost.position);
+    pivotGhost.visible = false; dirty = true;
+    canvas.style.cursor = tool === 'nav' ? 'grab' : 'crosshair';
+    return;
+  }
   if (draft?.drawing) {
     controls.enabled = true;
     const d = draft; clearDraft();
@@ -451,7 +502,10 @@ canvas.addEventListener('pointerup', (e) => {
   if (moved > 5 || performance.now() - down.t > 600) return;
   onClick(e);
 });
-canvas.addEventListener('dblclick', () => { if (tool === 'area' && draft) { draft.pts.pop(); finishDraft(); } });
+canvas.addEventListener('dblclick', (e) => {
+  if (tool === 'area' && draft) { draft.pts.pop(); finishDraft(); return; }
+  if (tool === 'nav') { const h = surfaceHit(e.clientX, e.clientY, 0); if (h) setPivot(h.point); }
+});
 
 function onClick(e) {
   if (tool === 'nav' || tool === 'erase') {
@@ -567,7 +621,10 @@ function download(name, blob) {
   a.href = u; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(u), 2000);
 }
 function screenshot() {
+  const pv = pivot.visible;
+  pivot.visible = false;
   renderer.render(scene, camera);
+  pivot.visible = pv; dirty = true;
   const w = canvas.width, h = canvas.height, k = w / canvas.clientWidth;
   const c = document.createElement('canvas'); c.width = w; c.height = h;
   const g = c.getContext('2d'); g.drawImage(canvas, 0, 0);
@@ -588,6 +645,7 @@ function screenshot() {
 document.querySelectorAll('[data-view]').forEach((b) => (b.onclick = () => ready && setView(b.dataset.view)));
 $('#bright').oninput = (e) => setBrightness(e.target.value);
 $('#showAnn').onchange = () => { anns.forEach(styleBadge); dirty = true; };
+$('#showPivot').onchange = (e) => { pivot.visible = e.target.checked; dirty = true; };
 $('#undo').onclick = undo; $('#redo').onclick = redo;
 $('#clearAll').onclick = () => { if (anns.length && confirm('¿Borrar todas las anotaciones?')) { anns = []; sel = null; rebuildAll(); commit(); } };
 $('#openGlb').onclick = () => $('#glbFile').click();
@@ -628,6 +686,9 @@ function frame(now) {
     const d = camera.position.distanceTo(controls.target);
     camera.near = Math.max(0.02, d / 400); camera.far = Math.max(500, d * 30);
     camera.updateProjectionMatrix();
+    pivot.position.copy(controls.target);
+    pivot.scale.setScalar(d * 0.06);
+    pivotGhost.scale.setScalar(camera.position.distanceTo(pivotGhost.position) * 0.06);
     renderer.render(scene, camera);
     updateBadges();
     dirty = false;
